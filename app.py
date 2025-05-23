@@ -108,27 +108,48 @@ def clean_text(text):
         logger.error(f"Error cleaning text: {str(e)}")
         return text
 
-def extract_text_pdfplumber(file_path):
-    """Extract text from PDF using pdfplumber."""
+def extract_images_pdfplumber(pdf_path):
+    """Extract images and captions from PDF."""
     try:
-        full_text = ""
-        page_texts = []
-        with pdfplumber.open(file_path) as pdf:
+        page_image_map = {}
+        page_caption_map = {}
+        with pdfplumber.open(pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
-                full_text += text + "\n"
-                page_texts.append((page_num, text))
-        with open(os.path.join(TEMP_DIR, "raw_extracted_text.txt"), "w", encoding="utf-8") as f:
-            f.write(full_text)
-        logger.info("Saved raw text to raw_extracted_text.txt")
-        cleaned_text = clean_text(full_text)
-        with open(os.path.join(TEMP_DIR, "extracted_text.txt"), "w", encoding="utf-8") as f:
-            f.write(cleaned_text)
-        logger.info("Saved cleaned text to extracted_text.txt")
-        return cleaned_text, page_texts
+                images = page.images
+                page_images = []
+                page_captions = []
+                for img in images:
+                    x0, top, x1, bottom = img['x0'], img['top'], img['x1'], img['bottom']
+                    width, height = int(x1 - x0), int(bottom - top)
+                    if width <= 0 or height <= 0:
+                        continue
+                    pdf_images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
+                    if not pdf_images:
+                        continue
+                    pdf_image = pdf_images[0]
+                    img_box = (int(x0), int(top), int(x1), int(bottom))
+                    cropped_img = pdf_image.crop(img_box)
+                    img_path = os.path.join(TEMP_DIR, f"image_{page_num}_{len(page_images)}.png")
+                    cropped_img.save(img_path, format="PNG")
+                    page_images.append(img_path)
+                    caption_area = page.within_bbox((x0, bottom, x1, bottom + 50))
+                    caption_text = caption_area.extract_text() or ""
+                    if caption_text.strip():
+                        page_captions.append(caption_text.strip())
+                if page_images:
+                    page_image_map[page_num] = page_images
+                if page_captions:
+                    page_caption_map[page_num] = page_captions
+        with open(os.path.join(TEMP_DIR, "image_captions.txt"), "w", encoding="utf-8") as f:
+            for page_num, captions in page_caption_map.items():
+                f.write(f"Page {page_num + 1}:\n")
+                for cap in captions:
+                    f.write(f"  {cap}\n")
+        logger.info(f"Extracted {sum(len(images) for images in page_image_map.values())} images")
+        return page_image_map, page_caption_map
     except Exception as e:
-        logger.error(f"Error extracting text with pdfplumber: {str(e)}")
-        return None, []
+        logger.error(f"Error extracting images: {str(e)}")
+        return {}, {}
 
 def extract_text_pymupdf(file_path):
     """Extract text from PDF using PyMuPDF."""
