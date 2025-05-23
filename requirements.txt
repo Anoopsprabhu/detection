@@ -1,0 +1,8 @@
+streamlit
+docx2pdf
+pdf2image
+pdfplumber
+Pillow
+PyMuPDF
+transformers
+gtts
