@@ -10,32 +10,19 @@ from PIL import Image
 import fitz  # PyMuPDF
 from gtts import gTTS
 from transformers import pipeline, AutoTokenizer
+import transformers
 
-# Check for PyTorch or TensorFlow
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+# Suppress transformers library logging to avoid token-level debug output
+transformers.logging.set_verbosity_error()
 
-try:
-    import tensorflow as tf
-    TF_AVAILABLE = True
-except ImportError:
-    TF_AVAILABLE = False
-
-if not (TORCH_AVAILABLE or TF_AVAILABLE):
-    st.error("Error: Neither PyTorch nor TensorFlow is installed. Please install one of them to enable summarization.\n"
-             "- To install PyTorch: `pip install torch` (see https://pytorch.org/)\n"
-             "- To install TensorFlow: `pip install tensorflow` (see https://www.tensorflow.org/install/)")
-    pipeline = None
-else:
-    pipeline = pipeline
-    AutoTokenizer = AutoTokenizer
-
-# Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Set logging level to INFO to suppress DEBUG-level file system events
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Disable Streamlit file watcher to reduce in-event logs
+st.set_option('server.enableCORS', False)
+st.set_option('server.enableXsrfProtection', False)
+st.set_option('server.fileWatcherType', 'none')  # Disable file watching
 
 # Directory for temporary files
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "chapter_summarizer")
@@ -131,7 +118,7 @@ def clean_text(text):
 
         cleaned_text = '\n'.join(cleaned_lines)
         cleaned_text = re.sub(r'\n\s*\n+', '\n\n', cleaned_text).strip()
-        logger.debug(f"Cleaned text (first 500 chars): {cleaned_text[:500]}...")
+        logger.info(f"Cleaned text (first 500 chars): {cleaned_text[:500]}...")
         return cleaned_text
     except Exception as e:
         logger.error(f"Error cleaning text: {str(e)}")
@@ -363,6 +350,11 @@ def summarize_text(text):
             logger.error("Input text is too short or empty for summarization")
             return "Error: Input text is too short or empty."
         
+        # Early check for oversized input
+        if len(text) > 100000:  # Arbitrary limit to prevent memory issues
+            logger.error("Input text is too large for summarization")
+            return "Error: Input text is too large for summarization."
+        
         # Clean text
         text = re.sub(r'[^\x00-\x7F]+', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
@@ -422,6 +414,15 @@ def generate_summary_parts(text):
                 "Error: Input text is too short or empty.",
                 "- Error: Unable to generate key points due to insufficient content.",
                 "Error: Input text is too short or empty."
+            )
+
+        # Early check for oversized input
+        if len(text) > 100000:
+            logger.error("Input text is too large for summarization")
+            return (
+                "Error: Input text is too large for summarization.",
+                "- Error: Unable to generate key points due to excessive content length.",
+                "Error: Input text is too large for summarization."
             )
 
         # Clean text
@@ -632,9 +633,28 @@ def process_section(chapters, selected_section):
         "caption_summary": selected_caption_summary
     }
 
+# Clean up temporary files on startup
+def cleanup_temp_files():
+    """Remove old temporary files to prevent disk space issues."""
+    try:
+        for file in os.listdir(TEMP_DIR):
+            file_path = os.path.join(TEMP_DIR, file)
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+        logger.info("Cleaned up temporary files")
+    except Exception as e:
+        logger.error(f"Error cleaning up temporary files: {str(e)}")
+
 # Streamlit UI
 st.title("Chapter Summarizer and Audiobook Generator")
 st.markdown("Upload a PDF or DOC/DOCX file, select a chapter or subchapter, and view the summarized content, audiobook, extracted images, and image caption summary.")
+
+# Check for PyTorch/TensorFlow and display warning if missing
+if not (TORCH_AVAILABLE or TF_AVAILABLE):
+    st.warning("Summarization and audiobook generation are disabled due to missing dependencies.")
+
+# Clean up temporary files
+cleanup_temp_files()
 
 uploaded_file = st.file_uploader("Upload PDF or DOC/DOCX File", type=["pdf", "doc", "docx"])
 
@@ -694,6 +714,8 @@ if st.session_state['selected_section'] and st.session_state['selected_section']
         st.subheader("Chapter Audiobook")
         if result["audiobook_path"]:
             st.audio(result["audiobook_path"])
+        else:
+            st.warning("Audiobook generation failed.")
 
     st.subheader("Section Images")
     if result["images"]:
