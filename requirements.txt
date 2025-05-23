@@ -1,10 +1,10 @@
 streamlit
-docx2pdf
+transformers
+torch
+tensorflow
+pypandoc
 pdf2image
 pdfplumber
 Pillow
 PyMuPDF
-transformers
 gtts
-tensorflow
-torch
