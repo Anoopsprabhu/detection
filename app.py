@@ -24,7 +24,7 @@ except ImportError:
     TF_AVAILABLE = False
 
 if TORCH_AVAILABLE or TF_AVAILABLE:
-    from transformers import pipeline
+    from transformers import pipeline, AutoTokenizer
 else:
     pipeline = None
     st.error("Error: Neither PyTorch nor TensorFlow is installed. Please install one of them to enable summarization.\n"
@@ -66,6 +66,10 @@ def convert_docx_to_pdf(docx_path, pdf_path):
 def clean_text(text):
     """Clean text by removing headers, footers, figure captions, tables, and non-main content."""
     try:
+        # Remove non-ASCII characters and normalize whitespace
+        text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
         lines = text.split('\n')
         cleaned_lines = []
         page_texts = []
@@ -226,14 +230,20 @@ def summarize_image_captions(captions):
         return "No image captions available."
     if not (TORCH_AVAILABLE or TF_AVAILABLE) or not pipeline:
         return "Error: Summarization unavailable due to missing PyTorch or TensorFlow."
+    
     caption_text = "\n".join(captions)
+    caption_text = re.sub(r'[^\x00-\x7F]+', ' ', caption_text)
+    caption_text = re.sub(r'\s+', ' ', caption_text).strip()
+    
     try:
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-        summary = summarizer(caption_text, max_length=150, min_length=30, do_sample=False)
+        # Limit caption text to avoid token errors
+        summary = summarizer(caption_text[:900], max_length=150, min_length=30, do_sample=False)
         logger.info("Generated image caption summary")
         return summary[0]['summary_text'].strip()
     except Exception as e:
         logger.error(f"Error summarizing captions: {str(e)}")
+        logger.error(f"Caption content: {caption_text[:500]}")
         return "Error summarizing captions."
 
 def extract_chapters_fallback(text, page_image_map, page_caption_map, page_texts):
@@ -349,13 +359,30 @@ def summarize_text(text):
             logger.error("Input text is too short or empty for summarization")
             return "Error: Input text is too short or empty."
         
+        # Remove problematic characters and normalize whitespace
+        text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-        max_chunk = 1024
+        tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
+        
+        max_chunk = 900  # Reduced to stay within token limit
         overlap = 150
         chunks = []
         for i in range(0, len(text), max_chunk - overlap):
             chunk = text[i:i + max_chunk]
+            if len(chunk.strip()) < 30:
+                continue
+            # Check token count
+            tokens = tokenizer(chunk, truncation=False, return_tensors="pt")
+            if len(tokens['input_ids'][0]) > 1024:
+                chunk = chunk[:int(len(chunk) * 0.9)]  # Reduce chunk size if too long
             chunks.append(chunk)
+        
+        if not chunks:
+            logger.error("No valid chunks created for summarization")
+            return "Error: No valid chunks created for summarization."
+            
         summaries = []
         for chunk in chunks:
             try:
@@ -363,7 +390,9 @@ def summarize_text(text):
                 summaries.append(summary[0]['summary_text'])
             except Exception as e:
                 logger.error(f"Error summarizing chunk: {str(e)}")
+                logger.error(f"Chunk content: {chunk[:500]}")
                 summaries.append("Error summarizing this section.")
+        
         combined_summary = " ".join(summaries).strip()
         combined_summary = re.sub(r'\s+', ' ', combined_summary).strip()
         return combined_summary
@@ -390,32 +419,51 @@ def generate_summary_parts(text):
                 "Error: Input text is too short or empty."
             )
 
+        # Clean text for summarization
+        text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
         
-        conclusion_prompt = f"Provide a very concise conclusion (6 lines maximum) of the following content:\n\n{text[:1024]}"
+        # Conclusion
+        conclusion_prompt = f"Provide a very concise conclusion (6 lines maximum) of the following content:\n\n{text[:900]}"
         try:
+            tokens = tokenizer(conclusion_prompt, truncation=False, return_tensors="pt")
+            if len(tokens['input_ids'][0]) > 1024:
+                conclusion_prompt = conclusion_prompt[:int(len(conclusion_prompt) * 0.9)]
             conclusion = summarizer(conclusion_prompt, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
             conclusion = "\n".join(conclusion.split("\n")[:6]).strip()
         except Exception as e:
             logger.error(f"Error generating conclusion: {str(e)}")
             conclusion = "Error generating conclusion."
 
+        # Key Points
         keypoints_prompt = f"Summarize the following content into 5-7 key points, formatted as bullet points:\n\n{{text}}"
-        max_chunk = 1024
+        max_chunk = 900
         overlap = 150
         chunks = []
         for i in range(0, len(text), max_chunk - overlap):
             chunk = text[i:i + max_chunk]
+            if len(chunk.strip()) < 30:
+                continue
+            tokens = tokenizer(chunk, truncation=False, return_tensors="pt")
+            if len(tokens['input_ids'][0]) > 1024:
+                chunk = chunk[:int(len(chunk) * 0.9)]
             chunks.append(chunk)
         
         keypoint_summaries = []
         for chunk in chunks:
             try:
                 formatted_prompt = keypoints_prompt.format(text=chunk)
+                tokens = tokenizer(formatted_prompt, truncation=False, return_tensors="pt")
+                if len(tokens['input_ids'][0]) > 1024:
+                    formatted_prompt = formatted_prompt[:int(len(formatted_prompt) * 0.9)]
                 summary = summarizer(formatted_prompt, max_length=200, min_length=50, do_sample=False)[0]['summary_text']
                 keypoint_summaries.append(summary)
             except Exception as e:
                 logger.error(f"Error summarizing chunk for key points: {str(e)}")
+                logger.error(f"Chunk content: {chunk[:500]}")
                 keypoint_summaries.append("Error summarizing this section.")
         
         combined_keypoints = " ".join(keypoint_summaries).strip()
@@ -429,13 +477,18 @@ def generate_summary_parts(text):
         while len(keypoints) < 5:
             keypoints.append("- Additional point derived from content analysis.")
         
+        # Full Summary
         chunk_summaries = []
         for chunk in chunks:
             try:
+                tokens = tokenizer(chunk, truncation=False, return_tensors="pt")
+                if len(tokens['input_ids'][0]) > 1024:
+                    chunk = chunk[:int(len(chunk) * 0.9)]
                 summary = summarizer(chunk, max_length=200, min_length=50, do_sample=False)[0]['summary_text']
                 chunk_summaries.append(summary)
             except Exception as e:
                 logger.error(f"Error summarizing chunk for full summary: {str(e)}")
+                logger.error(f"Chunk content: {chunk[:500]}")
                 chunk_summaries.append("Error summarizing this section.")
         
         full_summary = " ".join(chunk_summaries).strip()
@@ -443,6 +496,9 @@ def generate_summary_parts(text):
         
         if len(full_summary) > 1000:
             try:
+                tokens = tokenizer(full_summary, truncation=False, return_tensors="pt")
+                if len(tokens['input_ids'][0]) > 1024:
+                    full_summary = full_summary[:900]
                 full_summary = summarizer(full_summary, max_length=500, min_length=200, do_sample=False)[0]['summary_text']
             except Exception as e:
                 logger.error(f"Error in final summarization of full summary: {str(e)}")
@@ -462,6 +518,9 @@ def generate_summary_parts(text):
 def text_to_audiobook(text, output_file):
     """Convert text to audiobook."""
     try:
+        # Clean text for audiobook
+        text = re.sub(r'[^\x00-\x7F]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
         tts = gTTS(text=text, lang='en')
         tts.save(output_file)
         logger.info(f"Generated audiobook: {output_file}")
