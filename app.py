@@ -8,8 +8,28 @@ from pdf2image import convert_from_path
 import pdfplumber
 from PIL import Image
 import fitz  # PyMuPDF
-from transformers import pipeline
 from gtts import gTTS
+
+# Check for PyTorch or TensorFlow
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+if TORCH_AVAILABLE or TF_AVAILABLE:
+    from transformers import pipeline
+else:
+    pipeline = None
+    st.error("Error: Neither PyTorch nor TensorFlow is installed. Please install one of them to enable summarization.\n"
+             "- To install PyTorch: `pip install torch` (see https://pytorch.org/)\n"
+             "- To install TensorFlow: `pip install tensorflow` (see https://www.tensorflow.org/install/)")
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -204,6 +224,8 @@ def summarize_image_captions(captions):
     """Summarize image captions."""
     if not captions:
         return "No image captions available."
+    if not (TORCH_AVAILABLE or TF_AVAILABLE) or not pipeline:
+        return "Error: Summarization unavailable due to missing PyTorch or TensorFlow."
     caption_text = "\n".join(captions)
     try:
         summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
@@ -318,6 +340,10 @@ def extract_chapters_fallback(text, page_image_map, page_caption_map, page_texts
 
 def summarize_text(text):
     """Summarize text using BART model with improved chunking."""
+    if not (TORCH_AVAILABLE or TF_AVAILABLE) or not pipeline:
+        logger.error("Summarization unavailable: PyTorch or TensorFlow not installed")
+        return "Error: Summarization unavailable due to missing PyTorch or TensorFlow."
+    
     try:
         if not text or len(text.strip()) < 50:
             logger.error("Input text is too short or empty for summarization")
@@ -347,6 +373,14 @@ def summarize_text(text):
 
 def generate_summary_parts(text):
     """Generate different parts of the summary: conclusion, key points, and full summary."""
+    if not (TORCH_AVAILABLE or TF_AVAILABLE) or not pipeline:
+        logger.error("Summarization unavailable: PyTorch or TensorFlow not installed")
+        return (
+            "Error: Summarization unavailable due to missing PyTorch or TensorFlow.",
+            "- Error: Unable to generate key points due to missing dependencies.",
+            "Error: Summarization unavailable due to missing PyTorch or TensorFlow."
+        )
+
     try:
         if not text or len(text.strip()) < 50:
             logger.error("Input text is too short or empty for summarization")
