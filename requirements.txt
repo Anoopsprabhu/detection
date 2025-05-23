@@ -1,10 +1,13 @@
+
 streamlit
-transformers
-torch
-tensorflow
+
+# ML libraries
+torch==2.2.2         # Use a stable CPU-compatible version
+tensorflow==2.15.0   # Also CPU-compatible, GPU isn't available on Streamlit Cloud
+transformers==4.39.3
 pypandoc
 pdf2image
 pdfplumber
-Pillow
 PyMuPDF
+Pillow
 gtts
