@@ -6,3 +6,5 @@ Pillow
 PyMuPDF
 transformers
 gtts
+tensorflow
+torch
