@@ -1,572 +1,607 @@
-import streamlit as st
-import cv2
-import numpy as np
 import os
-import json
-from datetime import datetime
-from PIL import Image
-import time
-from facenet_pytorch import MTCNN, InceptionResnetV1
-import torch
-import threading
+import streamlit as st
+import tempfile
 import logging
-from queue import Queue
+import re
+from docx2pdf import convert
+from pdf2image import convert_from_path
+import pdfplumber
+from PIL import Image
+import fitz  # PyMuPDF
+from transformers import pipeline
+from gtts import gTTS
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Define the directory and JSON file
-AUTHORIZED_DIR = "authorized_images"
-JSON_FILE = "authorized_images.json"
+# Directory for temporary files
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "chapter_summarizer")
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-class ImprovedPersonDetector:
-    def __init__(self):
-        """Initialize the detector with authorized images"""
-        self.authorized_faces = []
-        self.authorized_image_paths = []
-        self.lock = threading.Lock()
-        
-        if not os.path.exists(AUTHORIZED_DIR):
-            os.makedirs(AUTHORIZED_DIR)
-        
-        if os.path.exists(JSON_FILE):
-            try:
-                with open(JSON_FILE, 'r') as f:
-                    self.authorized_image_paths = json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading JSON: {e}")
-                self.authorized_image_paths = []
-        
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        logger.info(f"Using device: {self.device}")
-        
-        try:
-            self.mtcnn = MTCNN(keep_all=True, device=self.device, margin=20, min_face_size=60)
-            self.resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
-        except Exception as e:
-            logger.error(f"Model initialization failed: {e}")
-            st.error("Failed to initialize detection models. Check logs.")
-    
-    def load_images(self):
-        """Load authorized images"""
-        with self.lock:
-            self.authorized_faces = []
-            
-            # Process images in batches for better performance
-            batch_size = 4  # Process 4 images at a time
-            for i in range(0, len(self.authorized_image_paths), batch_size):
-                batch_paths = self.authorized_image_paths[i:i + batch_size]
-                batch_faces = []
-                
-                for idx, image_path in enumerate(batch_paths, start=i):
-                    try:
-                        logger.debug(f"Loading image: {image_path}")
-                        # Load and convert image in one step
-                        person_image = Image.open(image_path).convert('RGB')
-                        
-                        # Process face detection
-                        faces = self.mtcnn(person_image)
-                        
-                        if faces is not None and len(faces) > 0:
-                            # Process face embedding
-                            face_tensor = faces[0].to(self.device)
-                            face_embedding = self.resnet(face_tensor.unsqueeze(0)).detach().cpu().numpy()
-                            
-                            batch_faces.append({
-                                'id': idx + 1,
-                                'image': person_image,
-                                'embedding': face_embedding,
-                                'name': f"Person_{idx + 1}"
-                            })
-                            st.sidebar.success(f"✅ Loaded authorized person: Person_{idx + 1}")
-                            logger.info(f"Loaded authorized person {idx + 1}")
-                        else:
-                            st.sidebar.error(f"❌ No face found in authorized image {idx + 1}")
-                            logger.warning(f"No face detected in {image_path}")
-                    except Exception as e:
-                        st.sidebar.error(f"Error loading {image_path}: {str(e)}")
-                        logger.error(f"Error loading {image_path}: {e}")
-                
-                # Add batch to authorized faces
-                self.authorized_faces.extend(batch_faces)
-                
-                # Clear CUDA cache after each batch if using GPU
-                if self.device == 'cuda':
-                    torch.cuda.empty_cache()
-            
-            st.sidebar.info(f"Loaded {len(self.authorized_faces)} authorized persons")
-    
-    def remove_images(self):
-        """Remove all authorized images and delete all files listed in JSON"""
-        with self.lock:
-            if os.path.exists(JSON_FILE):
-                with open(JSON_FILE, 'r') as f:
-                    image_paths = json.load(f)
-                
-                for file_path in image_paths:
-                    if os.path.exists(file_path):
-                        try:
-                            # Close any open file handles
-                            try:
-                                with open(file_path, 'rb') as f:
-                                    f.close()
-                            except:
-                                pass
-                            
-                            # Add a small delay to ensure file is released
-                            time.sleep(0.5)
-                            
-                            # Try to delete the file
-                            try:
-                                os.remove(file_path)
-                                st.sidebar.success(f"🗑️ Deleted file: {os.path.basename(file_path)}")
-                            except PermissionError:
-                                st.sidebar.error(f"❌ Permission denied: {os.path.basename(file_path)}")
-                            except OSError as e:
-                                st.sidebar.error(f"❌ Failed to delete {os.path.basename(file_path)}: {str(e)}")
-                                # Try alternative deletion method
-                                try:
-                                    import gc
-                                    gc.collect()  # Force garbage collection
-                                    time.sleep(0.5)  # Wait for GC
-                                    os.remove(file_path)
-                                    st.sidebar.success(f"🗑️ Deleted file after retry: {os.path.basename(file_path)}")
-                                except:
-                                    st.sidebar.error(f"❌ Failed to delete {os.path.basename(file_path)} even after retry")
-                        except Exception as e:
-                            st.sidebar.error(f"❌ Error handling {os.path.basename(file_path)}: {str(e)}")
-                
-                # Clear the JSON file
-                with open(JSON_FILE, 'w') as f:
-                    json.dump([], f)
-            
-            self.authorized_faces = []
-            self.authorized_image_paths = []
-            st.sidebar.success("🗑️ All authorized images removed")
-    
-    def match_face(self, face_embedding, threshold=0.75):
-        """Match a detected face with authorized faces"""
-        with self.lock:
-            if not self.authorized_faces:
-                logger.warning("No authorized faces loaded")
-                return None, 0
-            
-            best_match = None
-            best_cosine_score = 0
-            best_euclidean_dist = float('inf')
-            
-            for auth_face in self.authorized_faces:
-                cosine_similarity = np.dot(face_embedding, auth_face['embedding'].T) / (
-                    np.linalg.norm(face_embedding) * np.linalg.norm(auth_face['embedding'])
-                )
-                cosine_score = (cosine_similarity + 1) / 2
-                euclidean_dist = np.linalg.norm(face_embedding - auth_face['embedding'])
-                
-                if cosine_score > best_cosine_score and euclidean_dist < 1.1:
-                    best_cosine_score = cosine_score
-                    best_euclidean_dist = euclidean_dist
-                    best_match = auth_face
-            
-            if best_cosine_score >= threshold:
-                confidence = float(best_cosine_score * 100)  # Convert to float explicitly
-                logger.info(f"Match found: {best_match['name']} with confidence {confidence:.1f}%")
-                return best_match, confidence
-            return None, 0
-        
-    def process_frame(self, frame, threshold=0.75):
-        """Process frame to detect authorized persons"""
-        try:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
-            faces = self.mtcnn(pil_image)
-            
-            detected_persons = []
-            
-            if faces is not None:
-                boxes = self.mtcnn.detect(pil_image)[0]
-                logger.debug(f"Detected {len(faces)} faces")
-                if boxes is not None:
-                    for i, face_tensor in enumerate(faces):
-                        if i >= len(boxes):
-                            continue
-                        
-                        face_embedding = self.resnet(face_tensor.unsqueeze(0).to(self.device)).detach().cpu().numpy()
-                        match, confidence = self.match_face(face_embedding, threshold)
-                        
-                        if match:
-                            box = boxes[i]
-                            left, top, right, bottom = map(int, box)
-                            person_name = match['name']
-                            detected_persons.append({"name": person_name, "confidence": float(confidence)})
-                            
-                            # Draw bounding box and info
-                            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                            info_text = f"{person_name} ({confidence:.1f}%)"
-                            cv2.rectangle(frame, (left, bottom - 25), (right, bottom), (0, 255, 0), cv2.FILLED)
-                            cv2.putText(frame, info_text, (left + 6, bottom - 6),
-                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            else:
-                logger.debug("No faces detected in frame")
-            
-            return frame, detected_persons
-        except Exception as e:
-            logger.error(f"Error processing frame: {str(e)}")
-            return frame, []
+# Initialize session state for storing outputs
+if 'GENERATED_OUTPUTS' not in st.session_state:
+    st.session_state['GENERATED_OUTPUTS'] = {}
+if 'section_titles' not in st.session_state:
+    st.session_state['section_titles'] = []
+if 'selected_section' not in st.session_state:
+    st.session_state['selected_section'] = None
+if 'file_processed' not in st.session_state:
+    st.session_state['file_processed'] = False
 
-def save_uploaded_file(uploaded_file):
-    """Save uploaded file to the authorized_images directory and update JSON"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{timestamp}_{uploaded_file.name}"
-    file_path = os.path.join(AUTHORIZED_DIR, filename)
-    
-    with open(file_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
-    
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE, 'r') as f:
-            image_paths = json.load(f)
-    else:
-        image_paths = []
-    
-    image_paths.append(file_path)
-    with open(JSON_FILE, 'w') as f:
-        json.dump(image_paths, f)
-    
-    return file_path
-
-def test_camera(camera_id, backend):
-    """Test if a camera can be opened and read frames"""
-    logger.info(f"Testing Camera {camera_id} with backend {backend}")
-    
-    # Try different backends
-    backends = [cv2.CAP_ANY, cv2.CAP_DSHOW]  # Try CAP_ANY first
-    cap = None
-    
-    for b in backends:
-        try:
-            time.sleep(0.5)  # Small delay before opening camera
-            cap = cv2.VideoCapture(camera_id, b)
-            if cap.isOpened():
-                logger.info(f"Successfully opened Camera {camera_id} with backend {b}")
-                # Try to read a frame immediately
-                ret, frame = cap.read()
-                if ret:
-                    logger.info(f"Successfully read frame from Camera {camera_id}")
-                    if cap:
-                        cap.release()
-                    return True
-                else:
-                    logger.warning(f"Failed to read frame from Camera {camera_id}")
-                    if cap:
-                        cap.release()
-            else:
-                logger.warning(f"Failed to open Camera {camera_id} with backend {b}")
-        except Exception as e:
-            logger.error(f"Error opening Camera {camera_id} with backend {b}: {str(e)}")
-            if cap:
-                cap.release()
-    
-    logger.error(f"Failed to open Camera {camera_id} with any backend")
-    return False
-
-def process_camera(detector, camera_id, threshold, stop_event, frame_queue, backend):
-    """Process camera feed and push frames to a queue"""
-    logger.info(f"Starting Camera {camera_id} with backend {backend}")
-    
-    # Try different backends
-    backends = [cv2.CAP_ANY, cv2.CAP_DSHOW]  # Try CAP_ANY first
-    cap = None
-    
-    for b in backends:
-        try:
-            time.sleep(0.5)  # Small delay before opening camera
-            cap = cv2.VideoCapture(camera_id, b)
-            if cap.isOpened():
-                logger.info(f"Successfully opened Camera {camera_id} with backend {b}")
-                # Try to read a frame immediately
-                ret, frame = cap.read()
-                if ret:
-                    logger.info(f"Successfully read frame from Camera {camera_id}")
-                    break
-                else:
-                    logger.warning(f"Failed to read frame from Camera {camera_id}")
-                    cap.release()
-            else:
-                logger.warning(f"Failed to open Camera {camera_id} with backend {b}")
-        except Exception as e:
-            logger.error(f"Error opening Camera {camera_id} with backend {b}: {str(e)}")
-            if cap:
-                cap.release()
-    
-    if not cap or not cap.isOpened():
-        error_msg = f"Failed to open Camera {camera_id} with any backend"
-        logger.error(error_msg)
-        frame_queue.put((camera_id, None, error_msg))
-        return
-    
+def convert_docx_to_pdf(docx_path, pdf_path):
+    """Convert DOCX to PDF."""
     try:
-        # Set camera properties for smooth scanning
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Enable auto exposure
-        
-        logger.info(f"Camera {camera_id} opened successfully")
-        frame_count = 0
-        last_detection_time = 0  # Track last detection time to avoid spam
-        
-        while not stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                logger.warning(f"Camera {camera_id} failed to read frame")
-                frame_queue.put((camera_id, None, "Frame read failed"))
-                break
-            
-            frame_count += 1
-            if frame_count % 30 == 0:  # Log every 30 frames
-                logger.debug(f"Camera {camera_id} processed {frame_count} frames")
-            
-            # Process frame for detection
-            frame, detected_persons = detector.process_frame(frame, threshold)
-            
-            # Update status text with smooth transitions
-            status = f"Camera {camera_id}: " + ("✅ DETECTED" if detected_persons else "Scanning...")
-            status_color = (0, 255, 0) if detected_persons else (255, 255, 255)
-            cv2.putText(frame, status, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-            
-            # Log detections with cooldown
-            current_time = time.time()
-            if detected_persons and (current_time - last_detection_time) > 1.0:  # 1 second cooldown
-                last_detection_time = current_time
-                with detector.lock:
-                    for person in detected_persons:
-                        detection_entry = {
-                            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "Camera": f"Camera {camera_id}",
-                            "Person": person["name"],
-                            "Confidence": f"{person['confidence']:.1f}%"
-                        }
-                        # Add detection to queue for main thread to process
-                        frame_queue.put((camera_id, None, detection_entry))
-                        logger.info(f"Detected {person['name']} on Camera {camera_id}")
-            
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_queue.put((camera_id, rgb_frame, None))
-            
-            # Smooth frame rate control
-            time.sleep(0.033)  # ~30 FPS
-            
+        convert(docx_path, pdf_path)
+        logger.info(f"Converted DOCX to PDF: {pdf_path}")
+        return pdf_path
     except Exception as e:
-        error_msg = f"Camera {camera_id} processing error: {str(e)}"
-        logger.error(error_msg)
-        frame_queue.put((camera_id, None, error_msg))
-    finally:
-        if cap:
-            cap.release()
-        logger.info(f"Camera {camera_id} released")
+        logger.error(f"Error converting DOCX to PDF: {str(e)}")
+        return None
 
-def main():
-    st.set_page_config(page_title="Multi-Camera Person Detection", layout="wide")
-    
-    st.title("Multi-Camera Authorized Person Detection System")
-    
-    # Initialize all session state variables
-    if 'detector' not in st.session_state:
-        st.session_state.detector = ImprovedPersonDetector()
-    
-    # Initialize other session state variables if they don't exist
-    if 'detection_active' not in st.session_state:
-        st.session_state.detection_active = {0: False, 1: False}
-    if 'detection_log' not in st.session_state:
-        st.session_state.detection_log = []
-    if 'threads' not in st.session_state:
-        st.session_state.threads = {0: None, 1: None}
-    if 'stop_events' not in st.session_state:
-        st.session_state.stop_events = {0: threading.Event(), 1: threading.Event()}
-    if 'frame_queues' not in st.session_state:
-        st.session_state.frame_queues = {0: Queue(maxsize=1), 1: Queue(maxsize=1)}
-    if 'last_frames' not in st.session_state:
-        st.session_state.last_frames = {0: None, 1: None}
-    if 'last_update' not in st.session_state:
-        st.session_state.last_update = time.time()
-    
-    # Sidebar configuration
-    st.sidebar.header("Configuration")
-    threshold = st.sidebar.slider("Detection Threshold", 0.5, 0.95, 0.75, 0.05)
-    backend = st.sidebar.selectbox("Camera Backend", [cv2.CAP_ANY, cv2.CAP_DSHOW], 
-                                  format_func=lambda x: "CAP_DSHOW" if x == cv2.CAP_DSHOW else "CAP_ANY")
-    
-    st.sidebar.subheader("Upload Authorized Persons")
-    authorized_uploads = st.sidebar.file_uploader(
-        "Upload images of authorized persons", 
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="auth_uploads"
-    )
-    
-    if st.sidebar.button("Load Authorized Images"):
-        if authorized_uploads:
-            st.session_state.detector.authorized_image_paths = []
-            for uploaded_file in authorized_uploads:
-                file_path = save_uploaded_file(uploaded_file)
-                st.session_state.detector.authorized_image_paths.append(file_path)
-            st.session_state.detector.load_images()
-        else:
-            st.sidebar.error("Please upload images first!")
-    
-    if st.sidebar.button("Remove Authorized Images"):
-        st.session_state.detector.remove_images()
-    
-    if st.session_state.detector.authorized_image_paths:
-        st.sidebar.subheader("Authorized Persons")
-        cols = st.sidebar.columns(min(3, len(st.session_state.detector.authorized_image_paths)))
-        for idx, img_path in enumerate(st.session_state.detector.authorized_image_paths):
-            with cols[idx % 3]:
-                img = Image.open(img_path)
-                st.image(img, caption=f"Person {idx + 1}", width=100)
-    
-    # Main layout
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.header("Live Camera Feeds")
-        
-        # Global start/stop button
-        start_stop_col = st.columns(3)
-        with start_stop_col[1]:
-            if not any(st.session_state.detection_active.values()):
-                if st.button("Start Detection", key="start_both", type="primary"):
-                    # First stop any existing threads
-                    for cam_id in [0, 1]:
-                        if st.session_state.threads[cam_id]:
-                            st.session_state.stop_events[cam_id].set()
-                            st.session_state.threads[cam_id].join(timeout=1.0)
-                            st.session_state.threads[cam_id] = None
-                    
-                    # Start new threads
-                    available_cameras = []
-                    for cam_id in [0, 1]:
-                        logger.info(f"Attempting to start Camera {cam_id}")
-                        if test_camera(cam_id, backend):
-                            available_cameras.append(cam_id)
-                            st.session_state.detection_active[cam_id] = True
-                            st.session_state.stop_events[cam_id].clear()
-                            st.session_state.threads[cam_id] = threading.Thread(
-                                target=process_camera,
-                                args=(st.session_state.detector, cam_id, threshold, 
-                                      st.session_state.stop_events[cam_id], 
-                                      st.session_state.frame_queues[cam_id], backend)
-                            )
-                            st.session_state.threads[cam_id].daemon = True
-                            st.session_state.threads[cam_id].start()
-                            logger.info(f"Started thread for Camera {cam_id}")
-                            st.success(f"Camera {cam_id} started successfully")
-                            # Add a small delay between starting cameras
-                            time.sleep(0.5)
-                        else:
-                            st.error(f"Failed to start Camera {cam_id}")
-                    
-                    if not available_cameras:
-                        st.error("No cameras available! Check connections and permissions.")
-                        logger.error("No cameras detected")
-                    else:
-                        st.success(f"Started {len(available_cameras)} cameras")
-            else:
-                if st.button("Stop Detection", key="stop_both", type="secondary"):
-                    for cam_id in [0, 1]:
-                        if st.session_state.detection_active[cam_id]:
-                            st.session_state.detection_active[cam_id] = False
-                            st.session_state.stop_events[cam_id].set()
-                            if st.session_state.threads[cam_id]:
-                                st.session_state.threads[cam_id].join(timeout=1.0)
-                            st.session_state.threads[cam_id] = None
-                            logger.info(f"Camera {cam_id} thread stopped")
-                            st.success(f"Camera {cam_id} stopped")
-        
-        # Create two columns for cameras
-        camera_col1, camera_col2 = st.columns(2)
-        
-        # Camera 1
-        with camera_col1:
-            st.subheader("Camera 1")
-            camera1_status = st.empty()
-            camera1_placeholder = st.empty()
-            
-            if st.session_state.detection_active[0]:
-                camera1_status.success("Camera 1: Active")
-                # Display last frame if available
-                if st.session_state.last_frames[0] is not None:
-                    camera1_placeholder.image(st.session_state.last_frames[0], channels="RGB", use_column_width=True)
-            else:
-                camera1_status.info("Camera 1: Ready")
-        
-        # Camera 2
-        with camera_col2:
-            st.subheader("Camera 2")
-            camera2_status = st.empty()
-            camera2_placeholder = st.empty()
-            
-            if st.session_state.detection_active[1]:
-                camera2_status.success("Camera 2: Active")
-                # Display last frame if available
-                if st.session_state.last_frames[1] is not None:
-                    camera2_placeholder.image(st.session_state.last_frames[1], channels="RGB", use_column_width=True)
-            else:
-                camera2_status.info("Camera 2: Ready")
-        
-        # Update UI with frames from queues
-        current_time = time.time()
-        update_interval = 0.033  # ~30 FPS
-        
-        # Check if we should update the UI
-        if current_time - st.session_state.last_update >= update_interval:
-            for camera_id in [0, 1]:
-                if camera_id in st.session_state.frame_queues and not st.session_state.frame_queues[camera_id].empty():
-                    cam_id, frame, data = st.session_state.frame_queues[camera_id].get()
-                    if frame is not None:
-                        # Store the frame
-                        st.session_state.last_frames[camera_id] = frame
-                        # Display the frame
-                        if camera_id == 0:
-                            camera1_placeholder.image(frame, channels="RGB", use_column_width=True)
-                        else:
-                            camera2_placeholder.image(frame, channels="RGB", use_column_width=True)
-                    elif isinstance(data, dict):  # Detection entry
-                        st.session_state.detection_log.insert(0, data)
-                    elif isinstance(data, str):  # Error message
-                        if camera_id == 0:
-                            camera1_placeholder.error(f"Camera {cam_id}: {data}")
-                        else:
-                            camera2_placeholder.error(f"Camera {cam_id}: {data}")
-            st.session_state.last_update = current_time
-        
-        # Show overall status
-        active_cameras = sum(1 for active in st.session_state.detection_active.values() if active)
-        if active_cameras > 0:
-            st.success(f"Detection Active (Cameras: {active_cameras}/2)")
-        else:
-            st.error("Detection Inactive")
-        
-        # Force UI update
-        st.rerun()
-    
-    with col2:
-        st.header("Detection Log")
-        with st.container():
-            if st.session_state.detection_log:
-                # Sort log by timestamp (newest first)
-                sorted_log = sorted(st.session_state.detection_log, 
-                                  key=lambda x: x["Timestamp"], 
-                                  reverse=True)
-                st.dataframe(sorted_log, height=400)
-            else:
-                st.info("No authorized persons detected yet")
-        
-        if st.button("Refresh UI"):
-            st.rerun()
+def clean_text(text):
+    """Clean text by removing headers, footers, figure captions, tables, and non-main content."""
+    try:
+        lines = text.split('\n')
+        cleaned_lines = []
+        page_texts = []
+        current_page = []
 
-if __name__ == "__main__":
-    main()
+        for line in lines:
+            if line.strip() == '\f' or not line.strip():
+                if current_page:
+                    page_texts.append(current_page)
+                    current_page = []
+                continue
+            current_page.append(line.strip())
+        if current_page:
+            page_texts.append(current_page)
+
+        header_candidates = set()
+        footer_candidates = set()
+        for page in page_texts:
+            if not page:
+                continue
+            for line in page[:3]:
+                if line and len(line) < 100:
+                    header_candidates.add(line)
+            for line in page[-3:]:
+                if line and len(line) < 100:
+                    footer_candidates.add(line)
+
+        header_lines = {line for line in header_candidates if sum(line in page for page in page_texts) > len(page_texts) // 2}
+        footer_lines = {line for line in footer_candidates if sum(line in page for page in page_texts) > len(page_texts) // 2}
+
+        unwanted_patterns = [
+            r'Canara Engineering College.*',
+            r'Module \d+.*',
+            r'\d{2}[A-Z]{2}\d{2,3}.*',
+            r'Page \d+',
+            r'^\d+$',
+            r'^\s*Figure \d+\..*',
+            r'^\s*Table \d+\..*',
+            r'Copyright ©.*',
+            r'^\d{4}-\d{4}.*',
+            r'All rights reserved.*',
+            r'^\s*Date:.*',
+            r'^\s*\d+\s*/\s*\d+.*',
+        ]
+
+        for page in page_texts:
+            for line in page:
+                line = line.strip()
+                if not line:
+                    continue
+                if line in header_lines or line in footer_lines:
+                    continue
+                if any(re.match(pattern, line, re.IGNORECASE) for pattern in unwanted_patterns):
+                    continue
+                if len(line) < 30 and not re.match(r'^\d+\.\d+\s+.*$|^Chapter \d+.*$|^Section \d+.*$', line):
+                    continue
+                cleaned_lines.append(line)
+
+        cleaned_text = '\n'.join(cleaned_lines)
+        cleaned_text = re.sub(r'\n\s*\n+', '\n\n', cleaned_text).strip()
+        logger.debug(f"Cleaned text (first 500 chars): {cleaned_text[:500]}...")
+        return cleaned_text
+    except Exception as e:
+        logger.error(f"Error cleaning text: {str(e)}")
+        return text
+
+def extract_text_pdfplumber(file_path):
+    """Extract text from PDF using pdfplumber."""
+    try:
+        full_text = ""
+        page_texts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                full_text += text + "\n"
+                page_texts.append((page_num, text))
+        with open(os.path.join(TEMP_DIR, "raw_extracted_text.txt"), "w", encoding="utf-8") as f:
+            f.write(full_text)
+        logger.info("Saved raw text to raw_extracted_text.txt")
+        cleaned_text = clean_text(full_text)
+        with open(os.path.join(TEMP_DIR, "extracted_text.txt"), "w", encoding="utf-8") as f:
+            f.write(cleaned_text)
+        logger.info("Saved cleaned text to extracted_text.txt")
+        return cleaned_text, page_texts
+    except Exception as e:
+        logger.error(f"Error extracting text with pdfplumber: {str(e)}")
+        return None, []
+
+def extract_text_pymupdf(file_path):
+    """Extract text from PDF using PyMuPDF."""
+    try:
+        full_text = ""
+        page_texts = []
+        doc = fitz.open(file_path)
+        for page_num, page in enumerate(doc):
+            text = page.get_text("text") or ""
+            full_text += text + "\n"
+            page_texts.append((page_num, text))
+        doc.close()
+        with open(os.path.join(TEMP_DIR, "raw_extracted_text_pymupdf.txt"), "w", encoding="utf-8") as f:
+            f.write(full_text)
+        logger.info("Saved raw text to raw_extracted_text_pymupdf.txt")
+        cleaned_text = clean_text(full_text)
+        with open(os.path.join(TEMP_DIR, "extracted_text_pymupdf.txt"), "w", encoding="utf-8") as f:
+            f.write(cleaned_text)
+        logger.info("Saved cleaned text to extracted_text_pymupdf.txt")
+        return cleaned_text, page_texts
+    except Exception as e:
+        logger.error(f"Error extracting text with PyMuPDF: {str(e)}")
+        return None, []
+
+def extract_images_pdfplumber(pdf_path):
+    """Extract images and captions from PDF."""
+unofficial
+    try:
+        page_image_map = {}
+        page_caption_map = {}
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                images = page.images
+                page_images = []
+                page_captions = []
+                for img in images:
+                    x0, top, x1, bottom = img['x0'], img['top'], img['x1'], img['bottom']
+                    width, height = int(x1 - x0), int(bottom - top)
+                    if width <= 0 or height <= 0:
+                        continue
+                    pdf_images = convert_from_path(pdf_path, first_page=page_num+1, last_page=page_num+1)
+                    if not pdf_images:
+                        continue
+                    pdf_image = pdf_images[0]
+                    img_box = (int(x0), int(top), int(x1), int(bottom))
+                    cropped_img = pdf_image.crop(img_box)
+                    img_path = os.path.join(TEMP_DIR, f"image_{page_num}_{len(page_images)}.png")
+                    cropped_img.save(img_path, format="PNG")
+                    page_images.append(img_path)
+                    caption_area = page.within_bbox((x0, bottom, x1, bottom + 50))
+                    caption_text = caption_area.extract_text() or ""
+                    if caption_text.strip():
+                        page_captions.append(caption_text.strip())
+                if page_images:
+                    page_image_map[page_num] = page_images
+                if page_captions:
+                    page_caption_map[page_num] = page_captions
+        with open(os.path.join(TEMP_DIR, "image_captions.txt"), "w", encoding="utf-8") as f:
+            for page_num, captions in page_caption_map.items():
+                f.write(f"Page {page_num + 1}:\n")
+                for cap in captions:
+                    f.write(f"  {cap}\n")
+        logger.info(f"Extracted {sum(len(images) for images in page_image_map.values())} images")
+        return page_image_map, page_caption_map
+    except Exception as e:
+        logger.error(f"Error extracting images: {str(e)}")
+        return {}, {}
+
+def summarize_image_captions(captions):
+    """Summarize image captions."""
+    if not captions:
+        return "No image captions available."
+    caption_text = "\n".join(captions)
+    try:
+        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        summary = summarizer(caption_text, max_length=150, min_length=30, do_sample=False)
+        logger.info("Generated image caption summary")
+        return summary[0]['summary_text'].strip()
+    except Exception as e:
+        logger.error(f"Error summarizing captions: {str(e)}")
+        return "Error summarizing captions."
+
+def extract_chapters_fallback(text, page_image_map, page_caption_map, page_texts):
+    """Fallback parsing using regex."""
+    chapters = []
+    current_chapter = None
+    current_subchapter = None
+    lines = text.split('\n')
+    content_buffer = []
+
+    chapter_patterns = [
+        r'^(\d+\.\d+)\s+(.+)$',
+        r'^Chapter\s+(\d+)\s*[:-]?\s*(.+)$',
+        r'^Section\s+(\d+)\s*[:-]?\s*(.+)$',
+        r'^([IVX]+)\.\s+(.+)$',
+        r'^(Introduction|Abstract|Conclusion|Preface)\s*$',
+        r'^Part\s+(\d+)\s*[:-]?\s*(.+)$',
+    ]
+    subchapter_patterns = [
+        r'^(\d+\.\d+\.\d+)\s+(.+)$',
+        r'^\s*(\d+\.\d+)\s+(.+)$',
+    ]
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+
+        chapter_match = None
+        for pattern in chapter_patterns:
+            match = re.match(pattern, line)
+            if match:
+                chapter_match = match
+                break
+
+        subchapter_match = None
+        for pattern in subchapter_patterns:
+            match = re.match(pattern, line)
+            if match:
+                subchapter_match = match
+                break
+
+        if chapter_match:
+            if current_chapter and content_buffer:
+                current_chapter["content"] = "\n".join(content_buffer).strip()
+                if len(current_chapter["content"]) > 50:
+                    chapters.append(current_chapter)
+                content_buffer = []
+            number = chapter_match.group(1) if len(chapter_match.groups()) > 1 else ""
+            title = chapter_match.group(2) if len(chapter_match.groups()) > 1 else chapter_match.group(1)
+            chapter_title = f"{number} {title}".strip() if number else title
+            chapter_pages = []
+            for page_num, page_text in page_texts:
+                if chapter_title in page_text:
+                    chapter_pages.append(page_num)
+            chapter_images = []
+            chapter_captions = []
+            for page_num in chapter_pages:
+                chapter_images.extend(page_image_map.get(page_num, []))
+                chapter_captions.extend(page_caption_map.get(page_num, []))
+            caption_summary = summarize_image_captions(chapter_captions)
+            current_chapter = {
+                "title": chapter_title,
+                "content": "",
+                "subchapters": [],
+                "images": chapter_images,
+                "caption_summary": caption_summary,
+                "pages": chapter_pages
+            }
+            current_subchapter = None
+        elif subchapter_match and current_chapter:
+            if current_subchapter and content_buffer:
+                current_subchapter["content"] = "\n".join(content_buffer).strip()
+                if len(current_subchapter["content"]) > 50:
+                    current_chapter["subchapters"].append(current_subchapter)
+                content_buffer = []
+            number, title = subchapter_match.groups()
+            subchapter_title = f"{number} {title}".strip()
+            subchapter_pages = current_chapter["pages"]
+            subchapter_images = current_chapter["images"]
+            subchapter_captions = chapter_captions
+            caption_summary = summarize_image_captions(subchapter_captions)
+            current_subchapter = {
+                "title": subchapter_title,
+                "content": "",
+                "images": subchapter_images,
+                "caption_summary": caption_summary,
+                "pages": subchapter_pages
+            }
+        elif current_chapter and line and not any(keyword in line.lower() for keyword in ["figure", "table"]):
+            content_buffer.append(line)
+
+    if current_chapter and content_buffer:
+        if current_subchapter:
+            current_subchapter["content"] = "\n".join(content_buffer).strip()
+            if len(current_subchapter["content"]) > 50:
+                current_chapter["subchapters"].append(current_subchapter)
+        current_chapter["content"] = "\n".join(content_buffer).strip()
+        if len(current_chapter["content"]) > 50:
+            chapters.append(current_chapter)
+
+    logger.info(f"Extracted {len(chapters)} chapters with fallback parsing")
+    return chapters
+
+def summarize_text(text):
+    """Summarize text using BART model with improved chunking."""
+    try:
+        if not text or len(text.strip()) < 50:
+            logger.error("Input text is too short or empty for summarization")
+            return "Error: Input text is too short or empty."
+        
+        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        max_chunk = 1024
+        overlap = 150
+        chunks = []
+        for i in range(0, len(text), max_chunk - overlap):
+            chunk = text[i:i + max_chunk]
+            chunks.append(chunk)
+        summaries = []
+        for chunk in chunks:
+            try:
+                summary = summarizer(chunk, max_length=200, min_length=50, do_sample=False)
+                summaries.append(summary[0]['summary_text'])
+            except Exception as e:
+                logger.error(f"Error summarizing chunk: {str(e)}")
+                summaries.append("Error summarizing this section.")
+        combined_summary = " ".join(summaries).strip()
+        combined_summary = re.sub(r'\s+', ' ', combined_summary).strip()
+        return combined_summary
+    except Exception as e:
+        logger.error(f"Error summarizing text: {str(e)}")
+        return f"Error summarizing text: {str(e)}"
+
+def generate_summary_parts(text):
+    """Generate different parts of the summary: conclusion, key points, and full summary."""
+    try:
+        if not text or len(text.strip()) < 50:
+            logger.error("Input text is too short or empty for summarization")
+            return (
+                "Error: Input text is too short or empty.",
+                "- Error: Unable to generate key points due to insufficient content.",
+                "Error: Input text is too short or empty."
+            )
+
+        summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        
+        conclusion_prompt = f"Provide a very concise conclusion (6 lines maximum) of the following content:\n\n{text[:1024]}"
+        try:
+            conclusion = summarizer(conclusion_prompt, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
+            conclusion = "\n".join(conclusion.split("\n")[:6]).strip()
+        except Exception as e:
+            logger.error(f"Error generating conclusion: {str(e)}")
+            conclusion = "Error generating conclusion."
+
+        keypoints_prompt = f"Summarize the following content into 5-7 key points, formatted as bullet points:\n\n{{text}}"
+        max_chunk = 1024
+        overlap = 150
+        chunks = []
+        for i in range(0, len(text), max_chunk - overlap):
+            chunk = text[i:i + max_chunk]
+            chunks.append(chunk)
+        
+        keypoint_summaries = []
+        for chunk in chunks:
+            try:
+                formatted_prompt = keypoints_prompt.format(text=chunk)
+                summary = summarizer(formatted_prompt, max_length=200, min_length=50, do_sample=False)[0]['summary_text']
+                keypoint_summaries.append(summary)
+            except Exception as e:
+                logger.error(f"Error summarizing chunk for key points: {str(e)}")
+                keypoint_summaries.append("Error summarizing this section.")
+        
+        combined_keypoints = " ".join(keypoint_summaries).strip()
+        keypoints_lines = [line.strip() for line in combined_keypoints.split(". ") if line.strip()]
+        keypoints = []
+        for line in keypoints_lines[:7]:
+            if not line.startswith('-'):
+                keypoints.append(f"- {line}")
+            else:
+                keypoints.append(line)
+        while len(keypoints) < 5:
+            keypoints.append("- Additional point derived from content analysis.")
+        
+        chunk_summaries = []
+        for chunk in chunks:
+            try:
+                summary = summarizer(chunk, max_length=200, min_length=50, do_sample=False)[0]['summary_text']
+                chunk_summaries.append(summary)
+            except Exception as e:
+                logger.error(f"Error summarizing chunk for full summary: {str(e)}")
+                chunk_summaries.append("Error summarizing this section.")
+        
+        full_summary = " ".join(chunk_summaries).strip()
+        full_summary = re.sub(r'\s+', ' ', full_summary).strip()
+        
+        if len(full_summary) > 1000:
+            try:
+                full_summary = summarizer(full_summary, max_length=500, min_length=200, do_sample=False)[0]['summary_text']
+            except Exception as e:
+                logger.error(f"Error in final summarization of full summary: {str(e)}")
+        
+        logger.info("Generated all summary parts")
+        return conclusion, "\n".join(keypoints), full_summary
+        
+    except Exception as e:
+        logger.error(f"Error generating summary parts: {str(e)}")
+        fallback_summary = summarize_text(text)
+        return (
+            fallback_summary[:500] if fallback_summary else "Error: Unable to generate conclusion.",
+            "- Error: Unable to generate key points.",
+            fallback_summary if fallback_summary else "Error: Unable to generate full summary."
+        )
+
+def text_to_audiobook(text, output_file):
+    """Convert text to audiobook."""
+    try:
+        tts = gTTS(text=text, lang='en')
+        tts.save(output_file)
+        logger.info(f"Generated audiobook: {output_file}")
+        return output_file
+    except Exception as e:
+        logger.error(f"Error generating audiobook: {str(e)}")
+        return None
+
+def process_file(file, selected_section):
+    """Process uploaded file."""
+    if not file:
+        st.error("Please upload a file first.")
+        return None
+
+    # Save uploaded file to temporary directory
+    file_ext = os.path.splitext(file.name)[1].lower()
+    temp_file_path = os.path.join(TEMP_DIR, file.name)
+    with open(temp_file_path, "wb") as f:
+        f.write(file.read())
+
+    if file_ext in ['.doc', '.docx']:
+        temp_pdf = os.path.join(TEMP_DIR, "converted.pdf")
+        result = convert_docx_to_pdf(temp_file_path, temp_pdf)
+        if not result:
+            st.error("Error: Failed to convert DOCX to PDF.")
+            return None
+        file_path = temp_pdf
+    elif file_ext != '.pdf':
+        st.error("Error: Unsupported file format. Please upload a PDF or DOC/DOCX file.")
+        return None
+    else:
+        file_path = temp_file_path
+
+    full_text, page_texts = extract_text_pdfplumber(file_path)
+    if full_text is None or not full_text.strip():
+        full_text, page_texts = extract_text_pymupdf(file_path)
+        if not full_text:
+            st.error("Error: Failed to extract text from PDF.")
+            return None
+
+    page_image_map, page_caption_map = extract_images_pdfplumber(file_path)
+    chapters = extract_chapters_fallback(full_text, page_image_map, page_caption_map, page_texts)
+
+    if not chapters:
+        st.error("Error: No chapters extracted from the document.")
+        return None
+
+    section_titles = []
+    for chapter in chapters:
+        if chapter["title"]:
+            section_titles.append(chapter["title"])
+            for subchapter in chapter["subchapters"]:
+                if subchapter["title"]:
+                    section_titles.append(f"  {subchapter['title']}")
+
+    st.session_state['section_titles'] = section_titles
+    st.session_state['file_processed'] = True
+
+    if not selected_section:
+        return {
+            "conclusion": "Please select a section from the dropdown.",
+            "keypoints": "",
+            "images": [],
+            "caption_summary": "",
+            "audiobook_path": None,
+            "full_summary": "No full summary available."
+        }
+
+    selected_content = None
+    selected_images = []
+    selected_caption_summary = ""
+    for chapter in chapters:
+        if chapter["title"] == selected_section:
+            selected_content = chapter["content"]
+            selected_images = chapter["images"]
+            selected_caption_summary = chapter["caption_summary"]
+            break
+        for subchapter in chapter["subchapters"]:
+            if f"  {subchapter['title']}" == selected_section:
+                selected_content = subchapter["content"]
+                selected_images = subchapter["images"]
+                selected_caption_summary = subchapter["caption_summary"]
+                break
+        if selected_content:
+            break
+
+    if not selected_content or len(selected_content.strip()) < 50:
+        st.error("Error: Selected section content is too short or not found.")
+        return {
+            "conclusion": "Error: Selected section content is too short or not found.",
+            "keypoints": "",
+            "images": [],
+            "caption_summary": "",
+            "audiobook_path": None,
+            "full_summary": "No full summary available."
+        }
+
+    conclusion, keypoints, full_summary = generate_summary_parts(selected_content)
+    audio_path = os.path.join(TEMP_DIR, f"audio_{os.urandom(8).hex()}.mp3")
+    audiobook_path = text_to_audiobook(full_summary, audio_path)
+
+    st.session_state['GENERATED_OUTPUTS'][selected_section] = {
+        "conclusion": conclusion,
+        "keypoints": keypoints,
+        "full_summary": full_summary,
+        "audiobook_path": audiobook_path,
+        "images": selected_images,
+        "caption_summary": selected_caption_summary
+    }
+
+    return st.session_state['GENERATED_OUTPUTS'][selected_section]
+
+# Streamlit UI
+st.title("Chapter Summarizer and Audiobook Generator")
+st.markdown("Upload a PDF or DOC/DOCX file, select a chapter or subchapter, and view the summarized content, audiobook, extracted images, and image caption summary.")
+
+# File uploader
+uploaded_file = st.file_uploader("Upload PDF or DOC/DOCX File", type=["pdf", "doc", "docx"])
+
+# Section dropdown
+if st.session_state['file_processed']:
+    selected_section = st.selectbox("Select Chapter/Subchapter", st.session_state['section_titles'], index=0 if st.session_state['section_titles'] else None)
+else:
+    selected_section = st.selectbox("Select Chapter/Subchapter", [], disabled=True)
+
+# Process button
+if st.button("Process Section"):
+    if uploaded_file and selected_section:
+        with st.spinner("Processing..."):
+            result = process_file(uploaded_file, selected_section)
+        if result:
+            st.session_state['selected_section'] = selected_section
+            st.session_state['GENERATED_OUTPUTS'][selected_section] = result
+    else:
+        st.error("Please upload a file and select a section.")
+
+# Display outputs
+if st.session_state['selected_section'] and st.session_state['selected_section'] in st.session_state['GENERATED_OUTPUTS']:
+    result = st.session_state['GENERATED_OUTPUTS'][st.session_state['selected_section']]
+    
+    st.subheader("Selected Chapter/Subchapter")
+    st.text(st.session_state['selected_section'])
+
+    st.subheader("Concise Conclusion (6 lines or less)")
+    st.text_area("", result["conclusion"], height=100, disabled=True)
+
+    st.subheader("Key Features (Bullet Points)")
+    st.text_area("", result["keypoints"], height=200, disabled=True)
+
+    if st.button("Show Full Summary and Audiobook"):
+        st.session_state['show_full'] = True
+
+    if 'show_full' in st.session_state and st.session_state['show_full']:
+        st.subheader("Full Chapter Summary")
+        st.text_area("", result["full_summary"], height=400, disabled=True)
+
+        st.subheader("Chapter Audiobook")
+        if result["audiobook_path"]:
+            st.audio(result["audiobook_path"])
+
+    st.subheader("Section Images")
+    if result["images"]:
+        cols = st.columns(3)
+        for i, img_path in enumerate(result["images"]):
+            with cols[i % 3]:
+                st.image(img_path, caption=f"Image {i+1}")
+    else:
+        st.write("No images available.")
+
+    st.subheader("Image Caption Summary")
+    st.text_area("", result["caption_summary"], height=150, disabled=True)
+
+# Clear session state when new file is uploaded
+if uploaded_file and not st.session_state.get('current_file') == uploaded_file.name:
+    st.session_state['GENERATED_OUTPUTS'] = {}
+    st.session_state['section_titles'] = []
+    st.session_state['selected_section'] = None
+    st.session_state['file_processed'] = False
+    st.session_state['current_file'] = uploaded_file.name
+    st.session_state['show_full'] = False
