@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "chapter_summarizer")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Initialize session state for storing outputs
+# Initialize session state
 if 'GENERATED_OUTPUTS' not in st.session_state:
     st.session_state['GENERATED_OUTPUTS'] = {}
 if 'section_titles' not in st.session_state:
@@ -28,6 +28,10 @@ if 'selected_section' not in st.session_state:
     st.session_state['selected_section'] = None
 if 'file_processed' not in st.session_state:
     st.session_state['file_processed'] = False
+if 'current_file' not in st.session_state:
+    st.session_state['current_file'] = None
+if 'show_full' not in st.session_state:
+    st.session_state['show_full'] = False
 
 def convert_docx_to_pdf(docx_path, pdf_path):
     """Convert DOCX to PDF."""
@@ -432,11 +436,11 @@ def text_to_audiobook(text, output_file):
         logger.error(f"Error generating audiobook: {str(e)}")
         return None
 
-def process_file(file, selected_section):
-    """Process uploaded file."""
+def process_file(file):
+    """Process uploaded file and extract chapters."""
     if not file:
-        st.error("Please upload a file first.")
-        return None
+        st.error("Please upload a file.")
+        return None, []
 
     # Save uploaded file to temporary directory
     file_ext = os.path.splitext(file.name)[1].lower()
@@ -449,11 +453,11 @@ def process_file(file, selected_section):
         result = convert_docx_to_pdf(temp_file_path, temp_pdf)
         if not result:
             st.error("Error: Failed to convert DOCX to PDF.")
-            return None
+            return None, []
         file_path = temp_pdf
     elif file_ext != '.pdf':
         st.error("Error: Unsupported file format. Please upload a PDF or DOC/DOCX file.")
-        return None
+        return None, []
     else:
         file_path = temp_file_path
 
@@ -462,14 +466,14 @@ def process_file(file, selected_section):
         full_text, page_texts = extract_text_pymupdf(file_path)
         if not full_text:
             st.error("Error: Failed to extract text from PDF.")
-            return None
+            return None, []
 
     page_image_map, page_caption_map = extract_images_pdfplumber(file_path)
     chapters = extract_chapters_fallback(full_text, page_image_map, page_caption_map, page_texts)
 
     if not chapters:
         st.error("Error: No chapters extracted from the document.")
-        return None
+        return None, []
 
     section_titles = []
     for chapter in chapters:
@@ -479,18 +483,12 @@ def process_file(file, selected_section):
                 if subchapter["title"]:
                     section_titles.append(f"  {subchapter['title']}")
 
-    st.session_state['section_titles'] = section_titles
-    st.session_state['file_processed'] = True
+    return chapters, section_titles
 
+def process_section(chapters, selected_section):
+    """Process the selected section and generate outputs."""
     if not selected_section:
-        return {
-            "conclusion": "Please select a section from the dropdown.",
-            "keypoints": "",
-            "images": [],
-            "caption_summary": "",
-            "audiobook_path": None,
-            "full_summary": "No full summary available."
-        }
+        return None
 
     selected_content = None
     selected_images = []
@@ -525,7 +523,7 @@ def process_file(file, selected_section):
     audio_path = os.path.join(TEMP_DIR, f"audio_{os.urandom(8).hex()}.mp3")
     audiobook_path = text_to_audiobook(full_summary, audio_path)
 
-    st.session_state['GENERATED_OUTPUTS'][selected_section] = {
+    return {
         "conclusion": conclusion,
         "keypoints": keypoints,
         "full_summary": full_summary,
@@ -534,8 +532,6 @@ def process_file(file, selected_section):
         "caption_summary": selected_caption_summary
     }
 
-    return st.session_state['GENERATED_OUTPUTS'][selected_section]
-
 # Streamlit UI
 st.title("Chapter Summarizer and Audiobook Generator")
 st.markdown("Upload a PDF or DOC/DOCX file, select a chapter or subchapter, and view the summarized content, audiobook, extracted images, and image caption summary.")
@@ -543,22 +539,42 @@ st.markdown("Upload a PDF or DOC/DOCX file, select a chapter or subchapter, and 
 # File uploader
 uploaded_file = st.file_uploader("Upload PDF or DOC/DOCX File", type=["pdf", "doc", "docx"])
 
-# Section dropdown
-if st.session_state['file_processed']:
-    selected_section = st.selectbox("Select Chapter/Subchapter", st.session_state['section_titles'], index=0 if st.session_state['section_titles'] else None)
-else:
-    selected_section = st.selectbox("Select Chapter/Subchapter", [], disabled=True)
+# Process file on upload
+if uploaded_file and st.session_state['current_file'] != uploaded_file.name:
+    with st.spinner("Processing file..."):
+        chapters, section_titles = process_file(uploaded_file)
+        if chapters:
+            st.session_state['file_processed'] = True
+            st.session_state['section_titles'] = section_titles
+            st.session_state['chapters'] = chapters
+            st.session_state['current_file'] = uploaded_file.name
+            st.session_state['GENERATED_OUTPUTS'] = {}
+            st.session_state['selected_section'] = None
+            st.session_state['show_full'] = False
+        else:
+            st.session_state['file_processed'] = False
+            st.session_state['section_titles'] = []
+            st.session_state['chapters'] = []
+            st.session_state['current_file'] = None
 
-# Process button
-if st.button("Process Section"):
+# Section dropdown
+selected_section = st.selectbox(
+    "Select Chapter/Subchapter",
+    st.session_state['section_titles'],
+    index=0 if st.session_state['section_titles'] else None,
+    disabled=not st.session_state['file_processed']
+)
+
+# Process section button
+if st.button("Process Section", disabled=not (uploaded_file and selected_section)):
     if uploaded_file and selected_section:
-        with st.spinner("Processing..."):
-            result = process_file(uploaded_file, selected_section)
-        if result:
-            st.session_state['selected_section'] = selected_section
-            st.session_state['GENERATED_OUTPUTS'][selected_section] = result
+        with st.spinner("Processing section..."):
+            result = process_section(st.session_state['chapters'], selected_section)
+            if result:
+                st.session_state['GENERATED_OUTPUTS'][selected_section] = result
+                st.session_state['selected_section'] = selected_section
     else:
-        st.error("Please upload a file and select a section.")
+        st.warning("Please upload a file and select a section.")
 
 # Display outputs
 if st.session_state['selected_section'] and st.session_state['selected_section'] in st.session_state['GENERATED_OUTPUTS']:
@@ -576,7 +592,7 @@ if st.session_state['selected_section'] and st.session_state['selected_section']
     if st.button("Show Full Summary and Audiobook"):
         st.session_state['show_full'] = True
 
-    if 'show_full' in st.session_state and st.session_state['show_full']:
+    if st.session_state['show_full']:
         st.subheader("Full Chapter Summary")
         st.text_area("", result["full_summary"], height=400, disabled=True)
 
@@ -595,12 +611,3 @@ if st.session_state['selected_section'] and st.session_state['selected_section']
 
     st.subheader("Image Caption Summary")
     st.text_area("", result["caption_summary"], height=150, disabled=True)
-
-# Clear session state when new file is uploaded
-if uploaded_file and not st.session_state.get('current_file') == uploaded_file.name:
-    st.session_state['GENERATED_OUTPUTS'] = {}
-    st.session_state['section_titles'] = []
-    st.session_state['selected_section'] = None
-    st.session_state['file_processed'] = False
-    st.session_state['current_file'] = uploaded_file.name
-    st.session_state['show_full'] = False
